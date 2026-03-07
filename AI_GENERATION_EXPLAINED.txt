@@ -1,0 +1,619 @@
+================================================================================
+         MINDLINK — AI IMAGE & VIDEO GENERATION: HOW IT WORKS
+               A Plain-English, Step-by-Step Guide
+================================================================================
+
+Written for: Anyone reading the codebase for the first time
+Files covered:
+  - actions/generation.js              (backend — the brain)
+  - app/(main)/ai-generation/_components/generation-form.jsx    (UI v1)
+  - app/(main)/ai-generation/_components/generation-studio.jsx  (UI v2 — main)
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+  1. Big Picture — What happens when a user clicks "Generate"?
+  2. The Frontend (What the user sees)
+  3. The Backend Server Action (generation.js)
+  4. IMAGE Generation — step by step
+  5. VIDEO Generation — step by step
+  6. Credit System — how it works
+  7. Error Handling
+  8. How to write your own generation (step-by-step starter guide)
+  9. Environment Variables you need
+  10. Quick Reference — Key Terms
+
+================================================================================
+1. BIG PICTURE — What happens when a user clicks "Generate"?
+================================================================================
+
+Here is the full journey from button-click to result displayed on screen:
+
+  [User types a prompt]
+        |
+        v
+  [Clicks "Generate" button]
+        |
+        v
+  [Frontend checks: Do I have enough credits?]
+   - Image costs 1 credit
+   - Video costs 5 credits
+   - If not enough credits → show error toast, STOP here
+        |
+        v
+  [Frontend calls the Server Action: generateAIContent({ prompt, type })]
+        |
+        v
+  [Server Action (generation.js) runs on the SERVER — never in the browser]
+        |
+        v
+  [Server checks Clerk authentication — is the user logged in?]
+        |
+        v
+  [Server checks database (Prisma/PostgreSQL) — does the user exist & have credits?]
+        |
+        v
+  --- IF type === "image" ----------------------------------------
+  |   [Call HuggingFace API → get image Blob → convert to base64 data URL]
+  |   [Deduct 1 credit from database]
+  |   [Return { success: true, type: "image", url: "data:image/jpeg;base64,..."}]
+  ----------------------------------------------------------------
+        |
+  --- IF type === "video" ----------------------------------------
+  |   Step 1: POST to MiniMax API → get back a task_id
+  |   Step 2: Poll MiniMax every 10 seconds until status = "Success"
+  |           (max 30 polls = 5 minutes wait)
+  |   Step 3: Use file_id to call MiniMax Files API → get download URL
+  |   [Deduct 5 credits from database]
+  |   [Return { success: true, type: "video", videoUrl: "https://..." }]
+  ----------------------------------------------------------------
+        |
+        v
+  [Frontend receives the result]
+        |
+        v
+  [Result stored in React state → UI re-renders to show image or video]
+  [router.refresh() called → header re-fetches credit balance from server]
+
+================================================================================
+2. THE FRONTEND (What the user sees)
+================================================================================
+
+There are TWO UI components. Both do the same job but look different:
+  - generation-form.jsx   → simpler card layout (older version)
+  - generation-studio.jsx → two-column layout, more polished (main version)
+
+Both UI components do the following things:
+
+---------------------------------------------------------------
+Step A: Let the user pick Image or Video
+---------------------------------------------------------------
+
+  In generation-studio.jsx:
+    - There are two buttons ("Image" | "Video") in a toggle bar.
+    - When the user clicks one, React Hook Form's form.setValue("type", t) is called.
+    - This updates the "type" field in the form state.
+    - The component re-reads the type with: const selectedType = form.watch("type")
+    - Based on selectedType, the UI shows model information (name, cost, description).
+
+  In generation-form.jsx:
+    - Uses a <Tabs> component (from shadcn/ui) instead of plain buttons.
+    - onValueChange={field.onChange} connects the tab selection to the form.
+
+---------------------------------------------------------------
+Step B: Validate the form with Zod
+---------------------------------------------------------------
+
+  Both components use this schema:
+
+    const formSchema = z.object({
+      prompt: z.string().min(5, { message: "Prompt must be at least 5 characters." }),
+      type:   z.enum(["image", "video"]),
+    });
+
+  This means:
+    - The prompt MUST be at least 5 characters long.
+    - The type MUST be either "image" or "video", nothing else.
+  
+  react-hook-form + zodResolver enforces this automatically.
+  If validation fails, error messages appear next to the form fields.
+
+---------------------------------------------------------------
+Step C: Submit the form (onSubmit function)
+---------------------------------------------------------------
+
+  When the user clicks "Generate":
+
+  1. Check credits on the frontend first (fast fail, avoids server round-trip):
+       const cost = values.type === "video" ? 5 : 1;
+       if (initialCredits < cost) { toast.error(...); return; }
+
+  2. Set loading = true  (shows the spinner / "Generating…" text)
+  3. Set result = null   (clears any old result from screen)
+
+  4. Call the server action:
+       const data = await generateAIContent(values);
+       // values = { prompt: "...", type: "image" | "video" }
+
+  5. If it succeeds (data.success === true):
+       - setResult(data)       → triggers UI to show the image/video
+       - toast.success(...)    → green toast notification
+       - router.refresh()      → Next.js refreshes the page data (updates credit count)
+
+  6. If it throws an error:
+       - toast.error(error.message)  → red toast notification
+
+  7. Finally (always): setLoading(false) → hide spinner
+
+---------------------------------------------------------------
+Step D: Display the Result
+---------------------------------------------------------------
+
+  For IMAGE:
+    <img src={result.url} alt="Generated image" />
+    - The "url" is a base64 data URL (starts with "data:image/jpeg;base64,...")
+    - This works without any CDN or file upload because the image data
+      is embedded directly in the string.
+
+  For VIDEO:
+    <video src={result.videoUrl} controls autoPlay />
+    - The "videoUrl" is a direct HTTPS download link from MiniMax's servers.
+    - The browser downloads and plays the MP4 directly from that URL.
+
+  Download button:
+    - Opens the image/video in a new tab (window.open) in generation-form.jsx
+    - Creates a hidden <a> tag and clicks it programmatically in generation-studio.jsx:
+        const a = document.createElement("a");
+        a.href = href;
+        a.download = `mindlink-${result.type}-${Date.now()}`;
+        a.click();
+
+================================================================================
+3. THE BACKEND SERVER ACTION (generation.js)
+================================================================================
+
+  What is a "Server Action"?
+  ---------------------------
+  The file starts with "use server" at line 1.
+  This is a Next.js feature. It means:
+    - This code RUNS ON THE SERVER (Node.js), not in the browser.
+    - The client (browser) can CALL these functions as if they were normal
+      async functions, but the actual execution happens server-side.
+    - This keeps your API keys secret — they never reach the browser.
+
+  The main exported function is:
+    export async function generateAIContent({ prompt, type })
+
+  It does three things before actually generating anything:
+    1. Checks if the user is authenticated (Clerk auth)
+    2. Looks up the user in the database (Prisma)
+    3. Checks if the user has enough credits
+
+================================================================================
+4. IMAGE GENERATION — Step by Step
+================================================================================
+
+  Provider : HuggingFace Inference API
+  Model    : Tongyi-MAI/Z-Image-Turbo
+  Via      : WaveSpeed inference engine
+  Cost     : 1 credit per generation
+  Output   : ~1024×1024 px image (returned as a binary Blob)
+
+---------------------------------------------------------------
+Step 1: Create a HuggingFace client
+---------------------------------------------------------------
+
+  const { InferenceClient } = await import("@huggingface/inference");
+  const client = new InferenceClient(process.env.HF_TOKEN);
+
+  - HF_TOKEN is your HuggingFace API key, read from the .env file.
+  - The import() is dynamic (lazy) — the library is only loaded when needed.
+  - InferenceClient is the official HuggingFace JS SDK client.
+
+---------------------------------------------------------------
+Step 2: Call textToImage()
+---------------------------------------------------------------
+
+  const imageBlob = await client.textToImage({
+    provider: "wavespeed",
+    model:    "Tongyi-MAI/Z-Image-Turbo",
+    inputs:   prompt,       // e.g. "A futuristic city at sunset"
+  });
+
+  - This sends your prompt to the HuggingFace API.
+  - HuggingFace routes the request to the WaveSpeed inference engine.
+  - The response is a Blob — raw binary image data (like a downloaded file).
+
+---------------------------------------------------------------
+Step 3: Convert Blob → base64 data URL
+---------------------------------------------------------------
+
+  const arrayBuffer = await imageBlob.arrayBuffer();
+  const base64      = Buffer.from(arrayBuffer).toString("base64");
+  const mimeType    = imageBlob.type || "image/jpeg";
+  imageUrl          = `data:${mimeType};base64,${base64}`;
+
+  WHY convert to base64?
+    - An HTML <img> tag cannot directly render a Node.js Blob.
+    - A base64 data URL (data:image/jpeg;base64,/9j/4AA...) can be used
+      directly as the src of an <img> tag in the browser.
+    - This avoids the need to upload the image to cloud storage (S3, etc.)
+      and serve it via a CDN. The image data travels inside the API response.
+
+---------------------------------------------------------------
+Step 4: Deduct 1 credit from the database
+---------------------------------------------------------------
+
+  await db.user.update({
+    where: { id: user.id },
+    data:  { credits: { decrement: creditCost } },  // creditCost = 1
+  });
+
+  NOTE: Credits are deducted AFTER the image is successfully generated.
+  This means if the API fails, the user is NOT charged.
+
+---------------------------------------------------------------
+Step 5: Return the result
+---------------------------------------------------------------
+
+  return {
+    success:          true,
+    type:             "image",
+    url:              imageUrl,              // the base64 data URL
+    creditsRemaining: user.credits - creditCost,
+  };
+
+================================================================================
+5. VIDEO GENERATION — Step by Step
+================================================================================
+
+  Provider : MiniMax
+  Model    : MiniMax-Hailuo-2.3
+  Cost     : 5 credits per generation
+  Output   : 6-second 1080P MP4 video
+  
+  Video generation is ASYNCHRONOUS — MiniMax renders the video on their
+  servers and you have to wait and check (poll) until it is ready.
+  This is different from image generation which is synchronous (instant response).
+
+  The process has 3 steps:
+
+---------------------------------------------------------------
+Step 1: Submit the video generation task
+---------------------------------------------------------------
+
+  const submitRes = await fetch("https://api.minimax.io/v1/video_generation", {
+    method:  "POST",
+    headers: {
+      "Authorization": `Bearer ${minimaxApiKey}`,
+      "Content-Type":  "application/json",
+    },
+    body: JSON.stringify({
+      prompt,
+      model:      "MiniMax-Hailuo-2.3",
+      duration:   6,          // 6-second video
+      resolution: "1080P",
+    }),
+  });
+
+  Response when successful looks like:
+    { task_id: "abc123xyz", base_resp: { status_code: 0, status_msg: "success" } }
+
+  - task_id is a unique identifier for your video job on MiniMax's servers.
+  - base_resp.status_code === 0 means success (any other number is an error).
+  - If task_id is missing, something went wrong — an error is thrown.
+
+---------------------------------------------------------------
+Step 2: Poll (repeatedly check) until the video is ready
+---------------------------------------------------------------
+
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 10_000));  // wait 10 seconds
+
+    const pollRes = await fetch(
+      `https://api.minimax.io/v1/query/video_generation?task_id=${task_id}`,
+      { headers: minimaxHeaders }
+    );
+
+    const pollData = await pollRes.json();
+
+    if (pollData.status === "Success") {
+      file_id = pollData.file_id;
+      break;                      // video is ready!
+    } else if (pollData.status === "Fail") {
+      throw new Error("MiniMax video generation failed: " + pollData.error_message);
+    }
+    // If status is "Processing" or "Queueing", keep looping
+  }
+
+  - The loop runs up to 30 times (30 × 10 seconds = 5 minutes maximum wait).
+  - Each iteration waits 10 seconds before checking again.
+  - Possible statuses from MiniMax: "Queueing", "Processing", "Success", "Fail"
+  - When status = "Success", MiniMax gives back a file_id.
+  - If after 30 polls it never succeeds → throw "MiniMax video generation timed out."
+
+---------------------------------------------------------------
+Step 3: Retrieve the download URL using the file_id
+---------------------------------------------------------------
+
+  const fileRes  = await fetch(
+    `https://api.minimax.io/v1/files/retrieve?file_id=${file_id}`,
+    { headers: minimaxHeaders }
+  );
+  const fileData = await fileRes.json();
+  videoUrl       = fileData?.file?.download_url;
+
+  - This gives you a direct HTTPS URL to the finished MP4 video file.
+  - This URL is hosted on MiniMax's servers (it will expire after some time).
+  - The URL is returned to the frontend, which renders it in a <video> tag.
+
+---------------------------------------------------------------
+Step 4: Deduct 5 credits from the database
+---------------------------------------------------------------
+
+  await db.user.update({
+    where: { id: user.id },
+    data:  { credits: { decrement: 5 } },
+  });
+
+  IMPORTANT: Just like image generation, credits are only deducted AFTER
+  the video is confirmed successful. If MiniMax fails, no credits are lost.
+
+---------------------------------------------------------------
+Step 5: Return the result
+---------------------------------------------------------------
+
+  return {
+    success:          true,
+    type:             "video",
+    videoUrl,                              // HTTPS URL from MiniMax
+    creditsRemaining: user.credits - 5,
+  };
+
+================================================================================
+6. CREDIT SYSTEM — How It Works
+================================================================================
+
+  Credits are stored in the "credits" column of the "User" table in the database.
+
+  Credit costs:
+    - Image generation = 1 credit
+    - Video generation = 5 credits
+
+  How credits are protected:
+    1. FRONTEND check (fast): Before calling the server, the frontend
+       checks if initialCredits >= cost. If not, shows an error and stops.
+       (initialCredits is passed as a prop from the server component)
+
+    2. BACKEND check (secure): The server re-checks the user's credit balance
+       from the database (cannot be faked by the client).
+
+       if ((user.credits ?? 0) < creditCost) {
+         throw new Error("Insufficient credits...");
+       }
+
+    3. ATOMIC decrement: Credits are deducted using Prisma's { decrement: N }
+       operation, which is safe against race conditions (two simultaneous
+       requests cannot both succeed with only 1 credit left).
+
+  After generation succeeds:
+    - Credits are updated in the DB.
+    - router.refresh() is called on the frontend.
+    - Next.js re-fetches the server component data, so the displayed credit
+      balance in the header updates automatically.
+
+  getUserCredits() function:
+    - A separate exported function that fetches the current user's credit balance.
+    - Used by server components (like the page layout) to pass initialCredits as a prop.
+
+================================================================================
+7. ERROR HANDLING
+================================================================================
+
+  The normaliseApiError() helper function:
+  -----------------------------------------
+  Located at the top of generation.js.
+  It translates raw API errors into clean, user-friendly messages:
+
+    HTTP 429 or "rate limit" → "AI quota exceeded. Please try again later."
+    HTTP 401 or "Unauthorized" → "Invalid API key. Please contact support."
+    HTTP 503 or "loading" → "Model is warming up. Please try again in a few seconds."
+    HTTP 404 or "not found" → "Model not available. Please try again later."
+    Anything else → the original error message
+
+  This is used for HuggingFace image errors.
+
+  For MiniMax video errors:
+    - If the submission fails (non-200 HTTP status) → throw with status code + body
+    - If base_resp.status_code !== 0 → throw with MiniMax's status_msg
+    - If polling returns "Fail" → throw with error_message from poll response
+    - If 30 polls pass without success → throw "MiniMax video generation timed out."
+    - If file retrieve fails → throw "Failed to retrieve video file from MiniMax."
+
+  On the frontend (both UI files):
+    try {
+      const result = await generateAIContent(values);
+      ...
+    } catch (error) {
+      toast.error(error.message || "Failed to generate content");
+    }
+
+================================================================================
+8. HOW TO WRITE YOUR OWN GENERATION (Beginner Starter Guide)
+================================================================================
+
+  Want to add a new type of AI generation to this project? Here's how:
+
+  ---------------------------------------------------------------
+  STEP 1: Choose an AI Service / API
+  ---------------------------------------------------------------
+  
+  Examples:
+    - Stable Diffusion via HuggingFace (for images)
+    - Runway ML (for video)
+    - OpenAI DALL·E (for images)
+    - ElevenLabs (for audio)
+
+  Get your API key from that service.
+
+  ---------------------------------------------------------------
+  STEP 2: Add your API key to .env
+  ---------------------------------------------------------------
+
+  In your .env file, add:
+    MY_NEW_API_KEY=sk-xxxxxxxxxxxxxxxx
+
+  NEVER hardcode API keys in your code. Always read from process.env.
+
+  ---------------------------------------------------------------
+  STEP 3: Add a new condition in generation.js
+  ---------------------------------------------------------------
+
+  Inside the generateAIContent function, add after the video block:
+
+    if (type === "audio") {
+      const apiKey = process.env.MY_NEW_API_KEY;
+      if (!apiKey) throw new Error("API key not configured.");
+
+      // Call your API here
+      const response = await fetch("https://api.example.com/generate", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text: prompt }),
+      });
+
+      if (!response.ok) throw new Error("API call failed: " + response.status);
+
+      const data = await response.json();
+      const audioUrl = data.url;
+
+      // Deduct credits
+      await db.user.update({
+        where: { id: user.id },
+        data:  { credits: { decrement: creditCost } },
+      });
+
+      return {
+        success: true,
+        type: "audio",
+        audioUrl,
+        creditsRemaining: user.credits - creditCost,
+      };
+    }
+
+  ---------------------------------------------------------------
+  STEP 4: Update the Zod schema in the frontend
+  ---------------------------------------------------------------
+
+  In generation-form.jsx or generation-studio.jsx, change:
+
+    type: z.enum(["image", "video"])
+  
+  to:
+  
+    type: z.enum(["image", "video", "audio"])
+
+  ---------------------------------------------------------------
+  STEP 5: Add the new toggle button in the UI
+  ---------------------------------------------------------------
+
+  In the mode toggle section of generation-studio.jsx, add "audio" to the
+  array: ["image", "video", "audio"]
+
+  ---------------------------------------------------------------
+  STEP 6: Display the result
+  ---------------------------------------------------------------
+
+  In the result display section, add a condition:
+
+    {result.type === "audio" && (
+      <audio src={result.audioUrl} controls autoPlay />
+    )}
+
+  ---------------------------------------------------------------
+  STEP 7: Set the credit cost
+  ---------------------------------------------------------------
+
+  In generation.js:
+    const creditCost = type === "video" ? 5 : type === "audio" ? 3 : 1;
+
+  ---------------------------------------------------------------
+  STEP 8: Test it
+  ---------------------------------------------------------------
+
+  1. Run the dev server: npm run dev
+  2. Log in with a test account that has credits
+  3. Select your new type
+  4. Enter a prompt and click Generate
+  5. Check the browser console AND the terminal for any errors
+  6. Verify that credits are deducted after a successful generation
+
+================================================================================
+9. ENVIRONMENT VARIABLES YOU NEED
+================================================================================
+
+  These must be set in your .env (or .env.local) file:
+
+  Variable Name           | Used For
+  ------------------------|--------------------------------------------------
+  HF_TOKEN                | HuggingFace API key — image generation
+  MINIMAX_API_KEY         | MiniMax API key — video generation
+  DATABASE_URL            | PostgreSQL database connection string (Prisma)
+  NEXT_PUBLIC_CLERK_...   | Clerk authentication keys
+  CLERK_SECRET_KEY        | Clerk server-side secret key
+
+  HOW TO GET THEM:
+    HF_TOKEN       → Create account at huggingface.co → Settings → Access Tokens
+    MINIMAX_API_KEY → Register at minimax.io → Dashboard → API Keys
+
+================================================================================
+10. QUICK REFERENCE — Key Terms
+================================================================================
+
+  Term              | What it means in this project
+  ------------------|------------------------------------------------------------
+  Server Action     | A Next.js function that runs on the server but can be called
+                    | from the browser like a normal async function. Marked with
+                    | "use server" at the top of the file.
+  Blob              | Binary Large Object — raw file data (like an image file
+                    | in memory). Returned by HuggingFace textToImage().
+  base64            | A way to encode binary data (like image bytes) as a
+                    | plain text string. Used so images can be embedded directly
+                    | in HTML without hosting them on a server.
+  data URL          | A URL that contains the actual file data, starts with
+                    | "data:image/jpeg;base64,...". Can be used as an <img> src.
+  Polling           | Repeatedly asking an API "is my task done yet?" at regular
+                    | intervals. Used for MiniMax video because rendering takes time.
+  task_id           | A unique ID that MiniMax gives you when you submit a video
+                    | job. You use it to check the job's status.
+  file_id           | A unique ID for the completed video file on MiniMax's servers.
+                    | Used to get the download URL.
+  HuggingFace       | A platform hosting thousands of open-source AI models.
+  WaveSpeed         | An inference engine (provider) on HuggingFace — optimised
+                    | for fast image generation.
+  MiniMax           | A Chinese AI company providing video generation API.
+  Hailuo-2.3        | The specific MiniMax video generation model used.
+  Z-Image-Turbo     | The HuggingFace image generation model used (by Tongyi-MAI).
+  Prisma            | The database ORM (Object-Relational Mapper) used to read
+                    | and write to the PostgreSQL database.
+  Clerk             | Authentication service — handles user login/logout.
+                    | auth() gives you the current user's userId.
+  Zod               | A library for data validation. Ensures form inputs match
+                    | expected types and constraints before submission.
+  react-hook-form   | A library for managing form state, validation, and submission
+                    | in React. Works together with Zod in this project.
+  toast             | A small popup notification (green = success, red = error).
+                    | Powered by the "sonner" library in this project.
+  router.refresh()  | A Next.js 13+ method that re-fetches all server component
+                    | data for the current page, refreshing the UI without a
+                    | full page reload. Used here to update the credit balance.
+
+================================================================================
+END OF DOCUMENT
+Written: 2026-03-07
+Project: MindLink AI Generation System
+================================================================================
