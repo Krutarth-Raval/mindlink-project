@@ -3,11 +3,6 @@ import Razorpay from "razorpay";
 import { auth } from "@clerk/nextjs/server";
 import { db } from "@/lib/prisma";
 
-const razorpay = new Razorpay({
-    key_id: process.env.RAZORPAY_KEY_ID,
-    key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
-
 const PLAN_MAPPING = {
     starter: { price: 99, credits: 10, name: "Starter Plan" },
     premium: { price: 199, credits: 20, name: "Premium Plan" },
@@ -15,6 +10,11 @@ const PLAN_MAPPING = {
 };
 
 export async function POST(req) {
+    const razorpay = new Razorpay({
+        key_id: process.env.RAZORPAY_KEY_ID,
+        key_secret: process.env.RAZORPAY_KEY_SECRET,
+    });
+
     try {
         const { userId: clerkUserId } = await auth();
         if (!clerkUserId) {
