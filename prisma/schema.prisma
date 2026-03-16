@@ -17,7 +17,7 @@ model User {
   industryInsight IndustryInsight? @relation(fields: [industry], references: [industry])
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
-  credits       Int       @default(3)
+  credits       Int       @default(5)
 
   // Profile fields
   bio           String?
@@ -28,6 +28,7 @@ model User {
   assessments   Assessment[]
   resume        Resume?
   coverLetter   CoverLetter[]
+  transactions  Transaction[]
 }
 
 model Assessment {
@@ -97,4 +98,19 @@ model IndustryInsight {
   nextUpdate    DateTime  // Scheduled update time
 
   @@index([industry])
+}
+
+model Transaction {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id])
+  utr           String    @unique
+  amount        Float
+  credits       Int
+  status        String    @default("PENDING") // PENDING, APPROVED, REJECTED
+  planName      String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([userId])
 }
