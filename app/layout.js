@@ -7,6 +7,7 @@ import { ThemeProvider } from "@/components/theme-provider";
 import { dark } from "@clerk/themes";
 import { GithubIcon } from "lucide-react";
 import Link from "next/link";
+import { Analytics } from "@vercel/analytics/next";
 
 const inter = Inter({ subsets: ["latin"] });
 
@@ -46,6 +47,7 @@ export default function RootLayout({ children }) {
                 </Link>
               </div>
             </footer>
+            <Analytics />
           </ThemeProvider>
         </body>
       </html>
