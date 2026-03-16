@@ -81,7 +81,8 @@ export default function GenerationStudio({ initialCredits }) {
 
     const onSubmit = async (values) => {
         if (initialCredits < creditCost) {
-            toast.error(selectedType === "video" ? "Insufficient credits for video generation" : "Free limit reached — purchase credits to continue");
+            toast.error(selectedType === "video" ? "Insufficient credits for video generation" : "Insufficient credits to continue");
+            router.push("/buy-credits?redirect=/ai-generation");
             return;
         }
 

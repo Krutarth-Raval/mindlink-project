@@ -29,6 +29,7 @@ model User {
   resume        Resume?
   coverLetter   CoverLetter[]
   transactions  Transaction[]
+  paymentHistory PaymentHistory[]
 }
 
 model Assessment {
@@ -111,6 +112,20 @@ model Transaction {
   planName      String
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
+
+  @@index([userId])
+}
+
+model PaymentHistory {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id])
+  planName      String
+  creditsAdded  Int
+  amountPaid    Float
+  paymentId     String    @unique // Razorpay payment id
+  orderId       String?   // Razorpay order id
+  createdAt     DateTime  @default(now())
 
   @@index([userId])
 }
