@@ -175,9 +175,7 @@ export async function generateAIContent({ prompt, type }) {
 
                 } catch (runwayError) {
                     console.error("RunwayML Error:", runwayError.message);
-                    // Fall back to HF if Runway fails only if it's a transient error? 
-                    // No, let's just throw for now to respect the user's key choice.
-                    throw runwayError;
+                    console.log("Falling back to HuggingFace (Wan-AI)...");
                 }
             }
 
